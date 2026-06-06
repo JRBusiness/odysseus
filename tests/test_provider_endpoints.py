@@ -101,6 +101,18 @@ def test_headers_anthropic_uses_x_api_key():
     assert "Authorization" not in h
 
 
+@pytest.mark.parametrize("token", [
+    "oauth:claude-oauth-token",
+    "sk-ant-oat01-claude-oauth-token",
+])
+def test_headers_anthropic_oauth_uses_claude_code_bearer(token):
+    h = er.build_headers(token, "https://api.anthropic.com")
+    assert h["Authorization"].startswith("Bearer ")
+    assert h["anthropic-version"] == "2023-06-01"
+    assert "oauth-2025-04-20" in h["anthropic-beta"]
+    assert "x-api-key" not in h
+
+
 def test_headers_anthropic_without_key_still_sends_version():
     h = er.build_headers(None, "https://api.anthropic.com")
     assert h["anthropic-version"] == "2023-06-01"
@@ -118,6 +130,12 @@ def test_headers_openai_style_use_bearer(base):
     h = er.build_headers("secret", base)
     assert h["Authorization"] == "Bearer secret"
     assert "HTTP-Referer" not in h
+    assert "x-api-key" not in h
+
+
+def test_headers_openai_style_strips_explicit_oauth_prefix():
+    h = er.build_headers("oauth:codex-oauth-token", "https://api.openai.com/v1")
+    assert h["Authorization"] == "Bearer codex-oauth-token"
     assert "x-api-key" not in h
 
 

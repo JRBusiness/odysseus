@@ -12,7 +12,13 @@ from typing import Optional, Tuple, Dict
 from urllib.parse import urlparse, urlunparse
 
 from core.database import SessionLocal, ModelEndpoint
-from src.llm_core import _detect_provider, _host_match
+from src.llm_core import (
+    _anthropic_beta_header,
+    _detect_provider,
+    _host_match,
+    _is_anthropic_oauth_token,
+    _normalize_auth_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,16 +195,25 @@ def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
     """Build auth headers for an endpoint."""
     provider = _detect_provider(base)
     headers: Dict[str, str] = {}
+    token, explicit_oauth = _normalize_auth_token(api_key)
     if provider == "anthropic":
-        if api_key:
-            headers["x-api-key"] = api_key
+        if _is_anthropic_oauth_token(api_key):
+            # Keep an explicit oauth: marker in the session header so llm_core
+            # can still infer OAuth mode for opaque Claude tokens that do not
+            # carry Anthropic's sk-ant-oat prefix. llm_core strips it before
+            # sending the request upstream.
+            bearer = f"oauth:{token}" if explicit_oauth else token
+            headers["Authorization"] = f"Bearer {bearer}"
+            headers["anthropic-beta"] = _anthropic_beta_header()
+        elif token:
+            headers["x-api-key"] = token
         headers["anthropic-version"] = "2023-06-01"
         return headers
     if provider == "copilot":
         from src.copilot import copilot_headers
-        return copilot_headers(api_key)
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        return copilot_headers(token)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     if provider == "openrouter":
         headers.setdefault("HTTP-Referer", "https://github.com/pewdiepie-archdaemon/odysseus")
         headers.setdefault("X-OpenRouter-Title", "Odysseus")

@@ -26,6 +26,7 @@ if "core.database" not in sys.modules:
         "McpServer",
     ]:
         setattr(_core_db, _name, MagicMock())
+    _core_db.utcnow_naive = MagicMock()
     sys.modules["core.database"] = _core_db
 
 import routes.model_routes as model_routes

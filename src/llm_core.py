@@ -7,12 +7,23 @@ import logging
 import hashlib
 import threading
 import re
+import uuid
+import os
+import platform
 from fastapi import HTTPException
 from typing import Optional, Dict, List, Tuple
 from src.model_context import get_context_length, DEFAULT_CONTEXT
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
+
+CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+CLAUDE_CLI_VERSION = "2.1.88"
+STAINLESS_PACKAGE_VERSION = "0.74.0"
+STAINLESS_RUNTIME_VERSION = "v22.13.0"
+FINGERPRINT_SALT = "59cf53e54c78"
+_CLAUDE_CODE_DEVICE_ID = str(uuid.uuid4())
+_CLAUDE_CODE_SESSION_ID = str(uuid.uuid4())
 
 class LLMConfig:
     """Configuration constants for LLM operations."""
@@ -673,16 +684,157 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
             payload["tools"] = anthropic_tools
     return payload
 
-def _build_anthropic_headers(headers):
-    """Convert Bearer auth to x-api-key for Anthropic."""
+def _normalize_auth_token(value: Optional[str]) -> Tuple[str, bool]:
+    token = (value or "").strip()
+    if token.lower().startswith("oauth:"):
+        return token.split(":", 1)[1].strip(), True
+    return token, False
+
+
+def _is_anthropic_oauth_token(value: Optional[str]) -> bool:
+    token, explicit = _normalize_auth_token(value)
+    return bool(token) and (explicit or token.lower().startswith("sk-ant-oat"))
+
+
+def _anthropic_beta_header(model: str = "") -> str:
+    if "haiku" in (model or "").lower():
+        return (
+            "oauth-2025-04-20,interleaved-thinking-2025-05-14,"
+            "redact-thinking-2026-02-12,context-management-2025-06-27,"
+            "prompt-caching-scope-2026-01-05,claude-code-20250219"
+        )
+    return (
+        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"
+        "redact-thinking-2026-02-12,context-management-2025-06-27,"
+        "prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24"
+    )
+
+
+def _stainless_os() -> str:
+    if os.name == "nt":
+        return "Windows"
+    if sys_platform := platform.system():
+        return "MacOS" if sys_platform == "Darwin" else sys_platform
+    return "Linux"
+
+
+def _stainless_arch() -> str:
+    machine = platform.machine().lower()
+    if machine in {"aarch64", "arm64"}:
+        return "arm64"
+    if machine in {"x86_64", "amd64"}:
+        return "x64"
+    return "x86"
+
+
+def _build_anthropic_headers(headers, model: str = ""):
+    """Build Anthropic headers.
+
+    API keys use x-api-key. Claude Code OAuth tokens use Bearer auth plus the
+    Claude Code beta/Stainless header shape Anthropic expects for subscription
+    OAuth access tokens.
+    """
     h = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
     if headers:
         for k, v in headers.items():
             if k.lower() == "authorization" and isinstance(v, str) and v.startswith("Bearer "):
-                h["x-api-key"] = v[7:]
+                token, explicit_oauth = _normalize_auth_token(v[7:])
+                if token and (explicit_oauth or token.lower().startswith("sk-ant-oat")):
+                    h["Authorization"] = f"Bearer {token}"
+                    h["anthropic-beta"] = _anthropic_beta_header(model)
+                    h["anthropic-dangerous-direct-browser-access"] = "true"
+                    h["x-app"] = "cli"
+                    h["x-client-request-id"] = str(uuid.uuid4())
+                    h["X-Claude-Code-Session-Id"] = _CLAUDE_CODE_SESSION_ID
+                    h["User-Agent"] = f"claude-cli/{CLAUDE_CLI_VERSION} (external, cli)"
+                    h["X-Stainless-Lang"] = "js"
+                    h["X-Stainless-Package-Version"] = STAINLESS_PACKAGE_VERSION
+                    h["X-Stainless-Runtime"] = "node"
+                    h["X-Stainless-Runtime-Version"] = STAINLESS_RUNTIME_VERSION
+                    h["X-Stainless-Arch"] = _stainless_arch()
+                    h["X-Stainless-OS"] = _stainless_os()
+                    h["X-Stainless-Retry-Count"] = "0"
+                elif token:
+                    h["x-api-key"] = token
             else:
                 h[k] = v
     return h
+
+
+def _is_claude_code_oauth_headers(headers: Optional[Dict]) -> bool:
+    if not isinstance(headers, dict):
+        return False
+    auth = headers.get("Authorization") or headers.get("authorization")
+    beta = headers.get("anthropic-beta") or headers.get("Anthropic-Beta") or ""
+    return isinstance(auth, str) and auth.startswith("Bearer ") and "oauth-2025-04-20" in str(beta)
+
+
+def _claude_code_fingerprint(first_user: str) -> str:
+    chars = "".join(first_user[i] if i < len(first_user) else "0" for i in (4, 7, 20))
+    digest = hashlib.sha256(f"{FINGERPRINT_SALT}{chars}{CLAUDE_CLI_VERSION}".encode()).hexdigest()
+    return digest[:3]
+
+
+def _first_user_text_from_anthropic_payload(payload: Dict) -> str:
+    for message in payload.get("messages") or []:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    return str(block.get("text") or "")
+    return ""
+
+
+def _coerce_anthropic_system_blocks(system) -> List[Dict]:
+    if isinstance(system, list):
+        return [block for block in system if isinstance(block, dict)]
+    if isinstance(system, str) and system.strip():
+        return [{"type": "text", "text": system}]
+    return []
+
+
+def _build_claude_code_oauth_payload(payload: Dict, account_id: Optional[str] = None) -> Dict:
+    first_user = _first_user_text_from_anthropic_payload(payload)
+    fingerprint = _claude_code_fingerprint(first_user)
+    existing_system = _coerce_anthropic_system_blocks(payload.get("system"))
+    payload = dict(payload)
+    payload["system"] = [
+        {
+            "type": "text",
+            "text": (
+                f"x-anthropic-billing-header: cc_version={CLAUDE_CLI_VERSION}.{fingerprint}; "
+                "cc_entrypoint=cli;"
+            ),
+        },
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+        *existing_system,
+    ]
+    metadata = dict(payload.get("metadata") or {})
+    metadata["user_id"] = json.dumps({
+        "device_id": _CLAUDE_CODE_DEVICE_ID,
+        "account_uuid": account_id or "",
+        "session_id": _CLAUDE_CODE_SESSION_ID,
+    })
+    payload["metadata"] = metadata
+    return payload
+
+
+def _anthropic_oauth_url(url: str) -> str:
+    target = _normalize_anthropic_url(url)
+    if "beta=true" in target:
+        return target
+    return target + ("&beta=true" if "?" in target else "?beta=true")
+
+
+def _finalize_anthropic_request(url: str, model: str, headers: Optional[Dict], payload: Dict) -> Tuple[str, Dict, Dict]:
+    h = _build_anthropic_headers(headers, model=model)
+    if _is_claude_code_oauth_headers(h):
+        return _anthropic_oauth_url(url), h, _build_claude_code_oauth_payload(payload)
+    return _normalize_anthropic_url(url), h, payload
 
 def _parse_anthropic_response(data: dict) -> str:
     """Extract text from an Anthropic response.
@@ -853,12 +1005,16 @@ def _sanitize_llm_messages(messages: List[Dict]) -> List[Dict]:
 
 def _normalize_anthropic_url(url: str) -> str:
     """Ensure Anthropic URL points to /v1/messages."""
-    url = url.rstrip("/")
-    if url.endswith("/v1/messages"):
-        return url
-    if url.endswith("/v1"):
-        return url + "/messages"
-    return url + "/v1/messages"
+    url = (url or "").strip().rstrip("/")
+    parts = urlsplit(url)
+    path = (parts.path or "").rstrip("/")
+    if path.endswith("/v1/messages"):
+        new_path = path
+    elif path.endswith("/v1"):
+        new_path = path + "/messages"
+    else:
+        new_path = path + "/v1/messages"
+    return urlunsplit((parts.scheme, parts.netloc, new_path, parts.query, parts.fragment))
 
 
 def _model_list_base(url: str) -> str:
@@ -1014,9 +1170,8 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         return cached_response
 
     if provider == "anthropic":
-        target_url = _normalize_anthropic_url(url)
-        h = _build_anthropic_headers(headers)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
+        target_url, h, payload = _finalize_anthropic_request(url, model, headers, payload)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
         payload = _build_ollama_payload(
@@ -1160,9 +1315,8 @@ async def llm_call_async(
         return cached_response
 
     if provider == "anthropic":
-        target_url = _normalize_anthropic_url(url)
-        h = _build_anthropic_headers(headers)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
+        target_url, h, payload = _finalize_anthropic_request(url, model, headers, payload)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
         h = {"Content-Type": "application/json"}
@@ -1272,9 +1426,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         messages_copy = non_sys
 
     if provider == "anthropic":
-        target_url = _normalize_anthropic_url(url)
-        h = _build_anthropic_headers(headers)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools)
+        target_url, h, payload = _finalize_anthropic_request(url, model, headers, payload)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
         h = {"Content-Type": "application/json"}

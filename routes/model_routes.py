@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from core.database import SessionLocal, ModelEndpoint, Session as DbSession
 from core.middleware import require_admin
-from src.llm_core import _detect_provider, _host_match, ANTHROPIC_MODELS
+from src.llm_core import _detect_provider, _host_match, _is_anthropic_oauth_token, ANTHROPIC_MODELS
 from src.tls_overrides import llm_verify
 from src.settings import load_settings as _load_settings, save_settings as _save_settings
 from src.endpoint_resolver import (
@@ -514,13 +514,12 @@ def _probe_single_model(base: str, api_key: str, model_id: str, timeout: int = 1
     _test_tools = [{"type": "function", "function": {"name": "test", "description": "Test tool", "parameters": {"type": "object", "properties": {}}}}] if with_tools else None
 
     if provider == "anthropic":
-        from src.llm_core import _normalize_anthropic_url, _build_anthropic_headers, _build_anthropic_payload
-        target_url = _normalize_anthropic_url(base)
-        auth_headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        h = _build_anthropic_headers(auth_headers)
+        from src.llm_core import _build_anthropic_payload, _finalize_anthropic_request
+        auth_headers = build_headers(api_key, base)
         payload = _build_anthropic_payload(model_id, messages, 0.0, 5)
         if _test_tools:
             payload["tools"] = [{"name": "test", "description": "Test tool", "input_schema": {"type": "object", "properties": {}}}]
+        target_url, h, payload = _finalize_anthropic_request(base, model_id, auth_headers, payload)
     elif provider == "ollama":
         from src.llm_core import _build_ollama_payload
         target_url = build_chat_url(base)
@@ -622,9 +621,7 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
     if _detect_provider(base) == "anthropic":
         # Try Anthropic's /v1/models endpoint first
         url = build_models_url(base)
-        headers = {"anthropic-version": "2023-06-01"}
-        if api_key:
-            headers["x-api-key"] = api_key
+        headers = build_headers(api_key, base)
         try:
             r = httpx.get(url, headers=headers, timeout=timeout, verify=llm_verify())
             r.raise_for_status()
@@ -633,13 +630,13 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
             if models:
                 return models
         except httpx.HTTPStatusError as e:
-            if api_key:
+            if api_key and not _is_anthropic_oauth_token(api_key):
                 status = e.response.status_code if e.response is not None else "unknown"
                 logger.warning(f"Anthropic /v1/models failed with API key: HTTP {status}")
                 return []
             logger.warning(f"Anthropic /v1/models failed, using hardcoded list: {e}")
         except Exception as e:
-            if api_key:
+            if api_key and not _is_anthropic_oauth_token(api_key):
                 logger.warning(f"Anthropic /v1/models failed with API key: {e}")
                 return []
             logger.warning(f"Anthropic /v1/models failed, using hardcoded list: {e}")
